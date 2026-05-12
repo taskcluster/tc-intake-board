@@ -1,0 +1,44 @@
+name: Sync project dates
+
+on:
+  schedule:
+    - cron: "15 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run without making mutations"
+        type: boolean
+        default: false
+      verbose:
+        description: "Enable verbose logs"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-project-dates
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - run: npm ci
+
+      - name: Sync project dates
+        env:
+          GH_TOKEN: ${{ secrets.PROJECTS_TOKEN }}
+          ORG: taskcluster
+          PROJECT_NUMBER: "23"
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          VERBOSE: ${{ github.event.inputs.verbose || 'false' }}
+        run: npm run sync
