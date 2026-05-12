@@ -72,6 +72,7 @@ DONE_STATUS_VALUES="Done,Closed"
 ## Troubleshooting
 
 - Missing token: set `GH_TOKEN` locally or configure the `PROJECTS_TOKEN` repository secret for Actions.
+- Invalid authorization header: recreate `PROJECTS_TOKEN` with the raw token value only. Do not include quotes, `Bearer`, `token`, a private key, JSON, or trailing newlines.
 - Missing project fields: create `Intake date` and `Completed date` as Date fields.
 - Token lacks project scope: refresh or replace the token with organization project read/write permissions.
 - Completed source options missing: add `closedAt`, `project-done-observed`, and `manual` to the `Completed source` single-select field.

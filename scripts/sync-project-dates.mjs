@@ -276,6 +276,26 @@ export function validateOrgName(org) {
   }
 }
 
+export function validateGithubToken(token) {
+  if (typeof token !== "string" || token.trim() === "") {
+    throw new Error(
+      "GH_TOKEN is required. In GitHub Actions set GH_TOKEN=${{ secrets.PROJECTS_TOKEN }}; locally use a token with project scope.",
+    );
+  }
+
+  if (token !== token.trim() || /\s/.test(token)) {
+    throw new Error(
+      "GH_TOKEN/PROJECTS_TOKEN must be the raw GitHub token only, with no whitespace, newlines, quotes, or token/Bearer prefix. Recreate the repository secret with just the token value.",
+    );
+  }
+
+  if (/^(bearer|token)\s+/i.test(token)) {
+    throw new Error(
+      "GH_TOKEN/PROJECTS_TOKEN must not include a token type prefix. Recreate the repository secret with just the token value.",
+    );
+  }
+}
+
 export function buildPlannedUpdates(item, fields, options = {}) {
   const doneValues = options.doneValues ?? DEFAULT_DONE_STATUS_VALUES;
   const today = options.today ?? todayUtcDate();
@@ -662,11 +682,7 @@ function parseBoolean(value) {
 }
 
 function readConfig() {
-  if (!process.env.GH_TOKEN || process.env.GH_TOKEN.trim() === "") {
-    throw new Error(
-      "GH_TOKEN is required. In GitHub Actions set GH_TOKEN=${{ secrets.PROJECTS_TOKEN }}; locally use a token with project scope.",
-    );
-  }
+  validateGithubToken(process.env.GH_TOKEN);
 
   const org = process.env.ORG || "taskcluster";
   validateOrgName(org);

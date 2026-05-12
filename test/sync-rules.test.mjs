@@ -6,6 +6,7 @@ import {
   isDoneStatus,
   parseDoneStatusValues,
   toDateOnly,
+  validateGithubToken,
   validateOrgName,
 } from "../scripts/sync-project-dates.mjs";
 
@@ -197,4 +198,13 @@ test("validates GitHub organization login format", () => {
   assert.doesNotThrow(() => validateOrgName("taskcluster-ci_2"));
   assert.throws(() => validateOrgName("taskcluster/example"), /ORG must be/);
   assert.throws(() => validateOrgName(""), /ORG must be/);
+});
+
+test("validates GitHub token format before invoking gh", () => {
+  assert.doesNotThrow(() => validateGithubToken("ghp_abcdefghijklmnopqrstuvwxyz"));
+  assert.doesNotThrow(() => validateGithubToken("github_pat_abcdefghijklmnopqrstuvwxyz"));
+  assert.throws(() => validateGithubToken(""), /GH_TOKEN is required/);
+  assert.throws(() => validateGithubToken("ghp_abc\n"), /raw GitHub token only/);
+  assert.throws(() => validateGithubToken(" token ghp_abc"), /raw GitHub token only/);
+  assert.throws(() => validateGithubToken("Bearer ghp_abc"), /raw GitHub token only/);
 });
