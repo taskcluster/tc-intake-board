@@ -2,17 +2,8 @@ import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const DEFAULT_DONE_STATUS_VALUES = [
-  "Done",
-  "Closed",
-  "Completed",
-  "Complete",
-  "Resolved",
-];
-
-const REQUIRED_FIELDS = ["Intake date", "Completed date"];
-const OPTIONAL_FIELDS = ["Intake week", "Completed week", "Completed source"];
-const COMPLETED_SOURCE_OPTIONS = ["closedAt", "project-done-observed", "manual"];
+const OPENED_WEEK_FIELD_NAMES = ["Opened week", "Intake week"];
+const COMPLETED_WEEK_FIELD_NAME = "Completed week";
 
 const PROJECT_QUERY = `
 query($org: String!, $projectNumber: Int!) {
@@ -92,6 +83,7 @@ query($org: String!, $projectNumber: Int!, $cursor: String) {
               number
               title
               url
+              createdAt
               closed
               closedAt
             }
@@ -100,6 +92,7 @@ query($org: String!, $projectNumber: Int!, $cursor: String) {
               number
               title
               url
+              createdAt
               closed
               closedAt
               merged
@@ -148,6 +141,60 @@ query($org: String!, $projectNumber: Int!, $cursor: String) {
                 startDate
                 duration
               }
+              ... on ProjectV2ItemIssueFieldValue {
+                field {
+                  ... on ProjectV2FieldCommon {
+                    id
+                    name
+                    dataType
+                  }
+                }
+                issueFieldValue {
+                  __typename
+                  ... on IssueFieldDateValue {
+                    value
+                    field {
+                      ... on IssueFieldDate {
+                        id
+                        name
+                        dataType
+                      }
+                    }
+                  }
+                  ... on IssueFieldTextValue {
+                    value
+                    field {
+                      ... on IssueFieldText {
+                        id
+                        name
+                        dataType
+                      }
+                    }
+                  }
+                  ... on IssueFieldNumberValue {
+                    value
+                    field {
+                      ... on IssueFieldNumber {
+                        id
+                        name
+                        dataType
+                      }
+                    }
+                  }
+                  ... on IssueFieldSingleSelectValue {
+                    name
+                    value
+                    optionId
+                    field {
+                      ... on IssueFieldSingleSelect {
+                        id
+                        name
+                        dataType
+                      }
+                    }
+                  }
+                }
+              }
             }
           }
         }
@@ -161,21 +208,6 @@ query($org: String!, $projectNumber: Int!, $cursor: String) {
 }
 `;
 
-const UPDATE_DATE_MUTATION = `
-mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $date: Date!) {
-  updateProjectV2ItemFieldValue(input: {
-    projectId: $projectId
-    itemId: $itemId
-    fieldId: $fieldId
-    value: { date: $date }
-  }) {
-    projectV2Item {
-      id
-    }
-  }
-}
-`;
-
 const UPDATE_TEXT_MUTATION = `
 mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $text: String!) {
   updateProjectV2ItemFieldValue(input: {
@@ -183,21 +215,6 @@ mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $text: String!) {
     itemId: $itemId
     fieldId: $fieldId
     value: { text: $text }
-  }) {
-    projectV2Item {
-      id
-    }
-  }
-}
-`;
-
-const UPDATE_SINGLE_SELECT_MUTATION = `
-mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
-  updateProjectV2ItemFieldValue(input: {
-    projectId: $projectId
-    itemId: $itemId
-    fieldId: $fieldId
-    value: { singleSelectOptionId: $optionId }
   }) {
     projectV2Item {
       id
@@ -244,30 +261,6 @@ export function isoWeekString(dateString) {
   return `${weekYear}-W${String(week).padStart(2, "0")}`;
 }
 
-export function parseDoneStatusValues(raw) {
-  if (typeof raw !== "string" || raw.trim() === "") {
-    return [...DEFAULT_DONE_STATUS_VALUES];
-  }
-
-  const values = raw
-    .split(",")
-    .map((value) => value.trim())
-    .filter(Boolean);
-
-  return values.length > 0 ? values : [...DEFAULT_DONE_STATUS_VALUES];
-}
-
-export function isDoneStatus(value, doneValues) {
-  if (typeof value !== "string" || value.trim() === "") {
-    return false;
-  }
-
-  const normalizedValue = value.trim().toLowerCase();
-  return doneValues.some(
-    (doneValue) => doneValue.trim().toLowerCase() === normalizedValue,
-  );
-}
-
 export function validateOrgName(org) {
   if (typeof org !== "string" || !/^[A-Za-z0-9_-]+$/.test(org)) {
     throw new Error(
@@ -296,93 +289,42 @@ export function validateGithubToken(token) {
   }
 }
 
-export function buildPlannedUpdates(item, fields, options = {}) {
-  const doneValues = options.doneValues ?? DEFAULT_DONE_STATUS_VALUES;
-  const today = options.today ?? todayUtcDate();
-  const completedSourceOptions = options.completedSourceOptions ?? null;
+export function buildPlannedUpdates(item, fields) {
   const itemFields = item.fields ?? {};
   const updates = [];
 
-  const intakeDateField = getField(fields, "Intake date");
-  const intakeWeekField = getField(fields, "Intake week");
-  const completedDateField = getField(fields, "Completed date");
-  const completedWeekField = getField(fields, "Completed week");
-  const completedSourceField = getField(fields, "Completed source");
+  const openedWeekField = getOpenedWeekField(fields);
+  const completedWeekField = getField(fields, COMPLETED_WEEK_FIELD_NAME);
 
-  let effectiveIntakeDate = itemFields["Intake date"] ?? "";
+  const openedDate = firstDateOnly(
+    itemFields.Created,
+    item.openedAt,
+    item.contentCreatedAt,
+    item.createdAt,
+  );
   if (
-    isEmptyValue(effectiveIntakeDate) &&
-    supportsFieldType(intakeDateField, "DATE") &&
-    !isEmptyValue(item.createdAt)
-  ) {
-    effectiveIntakeDate = toDateOnly(item.createdAt);
-    updates.push(makeUpdate(item, intakeDateField, "date", effectiveIntakeDate));
-  }
-
-  if (
-    isEmptyValue(itemFields["Intake week"]) &&
-    supportsFieldType(intakeWeekField, "TEXT") &&
-    !isEmptyValue(effectiveIntakeDate)
+    isEmptyValue(itemFields[openedWeekField?.name]) &&
+    supportsFieldType(openedWeekField, "TEXT") &&
+    !isEmptyValue(openedDate)
   ) {
     updates.push(
-      makeUpdate(item, intakeWeekField, "text", isoWeekString(effectiveIntakeDate)),
+      makeUpdate(item, openedWeekField, "text", isoWeekString(openedDate)),
     );
   }
 
-  let effectiveCompletedDate = itemFields["Completed date"] ?? "";
-  let completedSource = null;
+  const completedDate = firstDateOnly(itemFields.Closed, item.closedAt);
 
   if (
-    isEmptyValue(effectiveCompletedDate) &&
-    supportsFieldType(completedDateField, "DATE")
-  ) {
-    if (!isEmptyValue(item.closedAt)) {
-      completedSource = "closedAt";
-      effectiveCompletedDate = toDateOnly(item.closedAt);
-    } else if (isDoneStatus(itemFields.Status, doneValues)) {
-      completedSource = "project-done-observed";
-      effectiveCompletedDate = today;
-    }
-
-    if (!isEmptyValue(effectiveCompletedDate)) {
-      updates.push(
-        makeUpdate(item, completedDateField, "date", effectiveCompletedDate, {
-          source: completedSource,
-        }),
-      );
-
-      if (
-        completedSource &&
-        isEmptyValue(itemFields["Completed source"]) &&
-        supportsFieldType(completedSourceField, "SINGLE_SELECT") &&
-        completedSourceOptions?.[completedSource]
-      ) {
-        updates.push(
-          makeUpdate(
-            item,
-            completedSourceField,
-            "singleSelect",
-            completedSource,
-            {
-              optionId: completedSourceOptions[completedSource],
-            },
-          ),
-        );
-      }
-    }
-  }
-
-  if (
-    isEmptyValue(itemFields["Completed week"]) &&
+    isEmptyValue(itemFields[COMPLETED_WEEK_FIELD_NAME]) &&
     supportsFieldType(completedWeekField, "TEXT") &&
-    !isEmptyValue(effectiveCompletedDate)
+    !isEmptyValue(completedDate)
   ) {
     updates.push(
       makeUpdate(
         item,
         completedWeekField,
         "text",
-        isoWeekString(effectiveCompletedDate),
+        isoWeekString(completedDate),
       ),
     );
   }
@@ -410,6 +352,27 @@ function supportsFieldType(field, expectedType) {
   return Boolean(field) && (!field.dataType || field.dataType === expectedType);
 }
 
+function firstDateOnly(...values) {
+  for (const value of values) {
+    if (!isEmptyValue(value)) {
+      return toDateOnly(value);
+    }
+  }
+
+  return "";
+}
+
+function getOpenedWeekField(fields) {
+  for (const fieldName of OPENED_WEEK_FIELD_NAMES) {
+    const field = getField(fields, fieldName);
+    if (field) {
+      return field;
+    }
+  }
+
+  return null;
+}
+
 function getField(fields, name) {
   if (!fields) {
     return null;
@@ -420,10 +383,6 @@ function getField(fields, name) {
   }
 
   return fields[name] ?? null;
-}
-
-function todayUtcDate() {
-  return new Date().toISOString().slice(0, 10);
 }
 
 function graphql(query, variables = {}) {
@@ -537,12 +496,15 @@ function normalizeItem(item) {
   const fieldValues = {};
 
   for (const fieldValue of item.fieldValues?.nodes ?? []) {
-    const fieldName = fieldValue?.field?.name;
+    const fieldName = fieldValue?.field?.name
+      ?? fieldValue?.issueFieldValue?.field?.name;
     if (!fieldName) {
       continue;
     }
 
-    if (Object.hasOwn(fieldValue, "date")) {
+    if (fieldValue.issueFieldValue) {
+      fieldValues[fieldName] = normalizeIssueFieldValue(fieldValue.issueFieldValue);
+    } else if (Object.hasOwn(fieldValue, "date")) {
       fieldValues[fieldName] = fieldValue.date ?? "";
     } else if (Object.hasOwn(fieldValue, "text")) {
       fieldValues[fieldName] = fieldValue.text ?? "";
@@ -556,97 +518,60 @@ function normalizeItem(item) {
   return {
     id: item.id,
     createdAt: item.createdAt,
+    openedAt: fieldValues.Created ?? item.content?.createdAt ?? item.createdAt,
+    contentCreatedAt: item.content?.createdAt ?? "",
     contentType: item.content?.__typename ?? item.type ?? "",
     contentUrl: item.content?.url ?? "",
-    closedAt: item.content?.closedAt ?? "",
+    closedAt: fieldValues.Closed ?? item.content?.closedAt ?? "",
     fields: fieldValues,
   };
+}
+
+function normalizeIssueFieldValue(issueFieldValue) {
+  if (Object.hasOwn(issueFieldValue, "value")) {
+    return issueFieldValue.value ?? "";
+  }
+
+  if (Object.hasOwn(issueFieldValue, "name")) {
+    return issueFieldValue.name ?? "";
+  }
+
+  return "";
 }
 
 function validateFields(fieldsByName, warn) {
   const errors = [];
 
-  for (const fieldName of REQUIRED_FIELDS) {
-    const field = fieldsByName.get(fieldName);
-    if (!field) {
-      errors.push(`Required field "${fieldName}" is missing.`);
-    } else if (field.dataType !== "DATE") {
-      errors.push(
-        `Required field "${fieldName}" must be DATE, found ${field.dataType}.`,
-      );
-    }
+  const openedWeekField = getOpenedWeekField(fieldsByName);
+  if (!openedWeekField) {
+    errors.push(
+      `Required opened-week field is missing. Create "Opened week" as a Text field, or keep legacy "Intake week".`,
+    );
+  } else if (openedWeekField.dataType !== "TEXT") {
+    errors.push(
+      `Opened-week field "${openedWeekField.name}" must be TEXT, found ${openedWeekField.dataType}.`,
+    );
   }
 
-  for (const fieldName of OPTIONAL_FIELDS) {
-    if (!fieldsByName.has(fieldName)) {
-      warn(`Optional field "${fieldName}" is missing; skipping related updates.`);
-    }
+  const completedWeekField = fieldsByName.get(COMPLETED_WEEK_FIELD_NAME);
+  if (!completedWeekField) {
+    errors.push(`Required field "${COMPLETED_WEEK_FIELD_NAME}" is missing.`);
+  } else if (completedWeekField.dataType !== "TEXT") {
+    errors.push(
+      `Required field "${COMPLETED_WEEK_FIELD_NAME}" must be TEXT, found ${completedWeekField.dataType}.`,
+    );
   }
 
-  warnIfWrongOptionalType(fieldsByName, "Intake week", "TEXT", warn);
-  warnIfWrongOptionalType(fieldsByName, "Completed week", "TEXT", warn);
-  warnIfWrongOptionalType(
-    fieldsByName,
-    "Completed source",
-    "SINGLE_SELECT",
-    warn,
-  );
+  if (!fieldsByName.has("Opened week") && fieldsByName.has("Intake week")) {
+    warn(`Using legacy field "Intake week" for opened-week updates.`);
+  }
 
   if (errors.length > 0) {
     throw new Error(`Project field validation failed:\n- ${errors.join("\n- ")}`);
   }
 }
 
-function warnIfWrongOptionalType(fieldsByName, fieldName, expectedType, warn) {
-  const field = fieldsByName.get(fieldName);
-  if (field && field.dataType !== expectedType) {
-    warn(
-      `Optional field "${fieldName}" must be ${expectedType}, found ${field.dataType}; skipping related updates.`,
-    );
-  }
-}
-
-function getCompletedSourceOptions(fieldsByName, warn) {
-  const field = fieldsByName.get("Completed source");
-  if (!field || field.dataType !== "SINGLE_SELECT") {
-    return null;
-  }
-
-  const optionsByName = new Map(
-    (field.options ?? []).map((option) => [option.name, option.id]),
-  );
-  const missing = COMPLETED_SOURCE_OPTIONS.filter(
-    (optionName) => !optionsByName.has(optionName),
-  );
-
-  if (missing.length > 0) {
-    warn(
-      `Optional field "Completed source" is missing options ${missing
-        .map((name) => `"${name}"`)
-        .join(", ")}; skipping source updates.`,
-    );
-    return null;
-  }
-
-  return Object.fromEntries(
-    COMPLETED_SOURCE_OPTIONS.map((optionName) => [
-      optionName,
-      optionsByName.get(optionName),
-    ]),
-  );
-}
-
 function executeUpdate(projectId, update) {
-  if (update.type === "date") {
-    graphql(UPDATE_DATE_MUTATION, {
-      projectId,
-      itemId: update.itemId,
-      fieldId: update.fieldId,
-      date: update.value,
-    });
-    return;
-  }
-
   if (update.type === "text") {
     graphql(UPDATE_TEXT_MUTATION, {
       projectId,
@@ -657,24 +582,11 @@ function executeUpdate(projectId, update) {
     return;
   }
 
-  if (update.type === "singleSelect") {
-    graphql(UPDATE_SINGLE_SELECT_MUTATION, {
-      projectId,
-      itemId: update.itemId,
-      fieldId: update.fieldId,
-      optionId: update.optionId,
-    });
-    return;
-  }
-
   throw new Error(`Unsupported update type: ${update.type}`);
 }
 
 function formatUpdate(update) {
-  const source = update.fieldName === "Completed date" && update.source
-    ? ` source=${update.source}`
-    : "";
-  return `[${update.itemId}] Set "${update.fieldName}" = ${update.value}${source}`;
+  return `[${update.itemId}] Set "${update.fieldName}" = ${update.value}`;
 }
 
 function parseBoolean(value) {
@@ -698,8 +610,6 @@ function readConfig() {
     projectNumber,
     dryRun: parseBoolean(process.env.DRY_RUN),
     verbose: parseBoolean(process.env.VERBOSE),
-    doneValues: parseDoneStatusValues(process.env.DONE_STATUS_VALUES),
-    today: todayUtcDate(),
   };
 }
 
@@ -717,14 +627,9 @@ function runSync() {
 
   validateFields(fieldsByName, warn);
 
-  const completedSourceOptions = getCompletedSourceOptions(fieldsByName, warn);
   const items = fetchProjectItems(config.org, config.projectNumber);
   const plannedUpdates = items.flatMap((item) =>
-    buildPlannedUpdates(item, fieldsByName, {
-      today: config.today,
-      doneValues: config.doneValues,
-      completedSourceOptions,
-    }),
+    buildPlannedUpdates(item, fieldsByName),
   );
 
   let executed = 0;

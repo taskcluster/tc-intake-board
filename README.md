@@ -1,15 +1,14 @@
 # Project Date Sync
 
-Adds temporal awareness to a GitHub Projects v2 board by filling missing intake, completion, week, and source fields. It is designed to be idempotent and does not overwrite existing project values.
+Adds week-level reporting to a GitHub Projects v2 board by filling missing opened and completed week fields. It is designed to be idempotent and does not overwrite existing project values.
 
 ## Setup
 
 1. Create or verify these Project v2 fields:
-   - Intake date: Date
-   - Completed date: Date
-   - Intake week: Text
+   - Opened week: Text
    - Completed week: Text
-   - Completed source: Single select with options `closedAt`, `project-done-observed`, `manual`
+
+   The legacy `Intake week` field name is still supported as the opened-week target.
 
 2. Create a token:
    - Preferred production option: GitHub App installation token with project read/write permissions.
@@ -37,9 +36,10 @@ GitHub's documentation recommends a GitHub App for organization project automati
 ## Behavior
 
 - Does not overwrite existing values.
-- Uses the project item `createdAt` timestamp for `Intake date`.
-- Uses issue or pull request `closedAt` for `Completed date` when available.
-- Uses the observed project `Done` status date as a fallback.
+- Reads GitHub Projects' built-in `Created` field for opened-week values.
+- Reads GitHub Projects' built-in `Closed` field for completed-week values.
+- Falls back to issue or pull request `createdAt`/`closedAt` values if the built-in field value is absent.
+- Only updates text week fields.
 - Uses UTC dates.
 - Derives ISO week values as `YYYY-Www`.
 
@@ -53,29 +53,21 @@ PROJECT_NUMBER=23
 GH_TOKEN=...
 DRY_RUN=false
 VERBOSE=false
-DONE_STATUS_VALUES=Done,Closed,Completed,Complete,Resolved
-```
-
-`DONE_STATUS_VALUES` accepts a comma-separated list, for example:
-
-```sh
-DONE_STATUS_VALUES="Done,Closed"
 ```
 
 ## Limitations
 
 - v1 does not create project fields.
 - v1 assumes project item `fieldValues` fit within the first 100 values.
-- v1 records the first observed project Done date if `closedAt` is unavailable.
-- v1 does not clear dates when issues are reopened.
+- v1 only fills `Completed week` when GitHub has a closed date.
+- v1 does not clear week fields when issues are reopened.
 
 ## Troubleshooting
 
 - Missing token: set `GH_TOKEN` locally or configure the `PROJECTS_TOKEN` repository secret for Actions.
 - Invalid authorization header: recreate `PROJECTS_TOKEN` with the raw token value only. Do not include quotes, `Bearer`, `token`, a private key, JSON, or trailing newlines.
-- Missing project fields: create `Intake date` and `Completed date` as Date fields.
+- Missing project fields: create `Opened week` and `Completed week` as Text fields.
 - Token lacks project scope: refresh or replace the token with organization project read/write permissions.
-- Completed source options missing: add `closedAt`, `project-done-observed`, and `manual` to the `Completed source` single-select field.
 
 ## Development
 
