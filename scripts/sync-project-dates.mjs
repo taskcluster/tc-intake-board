@@ -16,6 +16,12 @@ const PR_LIFECYCLE_OPTIONS = Object.freeze([
 ]);
 const STALE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
 
+// Each item now carries heavy per-item sub-selections (statusCheckRollup,
+// reviewThreads) on top of fieldValues. Keep the page small so a single
+// paginated query stays under GitHub's GraphQL execution timeout (large pages
+// were returning HTTP 502). Pagination still covers the whole board.
+const ITEMS_PAGE_SIZE = 20;
+
 const PROJECT_QUERY = `
 query($org: String!, $projectNumber: Int!) {
   organization(login: $org) {
@@ -82,7 +88,7 @@ const ITEMS_QUERY = `
 query($org: String!, $projectNumber: Int!, $cursor: String) {
   organization(login: $org) {
     projectV2(number: $projectNumber) {
-      items(first: 100, after: $cursor) {
+      items(first: ${ITEMS_PAGE_SIZE}, after: $cursor) {
         nodes {
           id
           createdAt
@@ -557,6 +563,8 @@ function getField(fields, name) {
   return fields[name] ?? null;
 }
 
+const GRAPHQL_MAX_ATTEMPTS = 4;
+
 function graphql(query, variables = {}) {
   const variableArgs = Object.entries(variables).flatMap(([name, value]) => {
     if (value === undefined || value === null) {
@@ -565,41 +573,70 @@ function graphql(query, variables = {}) {
     return ["-F", `${name}=${value}`];
   });
 
-  const result = spawnSync(
-    "gh",
-    ["api", "graphql", "-f", `query=${query}`, ...variableArgs],
-    {
-      env: process.env,
-      encoding: "utf8",
-      maxBuffer: 20 * 1024 * 1024,
-    },
-  );
+  let lastErrorMessage = "gh api graphql failed";
 
-  if (result.error) {
-    throw new Error(`Failed to run gh api graphql: ${result.error.message}`);
-  }
-
-  if (result.status !== 0) {
-    throw new Error(
-      `gh api graphql failed with exit code ${result.status}:\n${result.stderr}`,
+  for (let attempt = 1; attempt <= GRAPHQL_MAX_ATTEMPTS; attempt += 1) {
+    const result = spawnSync(
+      "gh",
+      ["api", "graphql", "-f", `query=${query}`, ...variableArgs],
+      {
+        env: process.env,
+        encoding: "utf8",
+        maxBuffer: 20 * 1024 * 1024,
+      },
     );
+
+    if (!result.error && result.status === 0) {
+      let parsed;
+      try {
+        parsed = JSON.parse(result.stdout);
+      } catch (error) {
+        throw new Error(`Failed to parse gh api graphql output: ${error.message}`);
+      }
+
+      if (Array.isArray(parsed.errors) && parsed.errors.length > 0) {
+        const messages = parsed.errors
+          .map((apiError) => apiError.message ?? JSON.stringify(apiError))
+          .join("\n");
+        throw new Error(`GitHub GraphQL returned errors:\n${messages}`);
+      }
+
+      return parsed.data;
+    }
+
+    const stderr = result.stderr ?? "";
+    lastErrorMessage = result.error
+      ? `Failed to run gh api graphql: ${result.error.message}`
+      : `gh api graphql failed with exit code ${result.status}:\n${stderr}`;
+
+    const retryable = isTransientGhError(result, stderr);
+    if (retryable && attempt < GRAPHQL_MAX_ATTEMPTS) {
+      const delayMs = 1000 * 2 ** (attempt - 1);
+      console.warn(
+        `Warning: transient GitHub error (attempt ${attempt}/${GRAPHQL_MAX_ATTEMPTS}), retrying in ${delayMs}ms...`,
+      );
+      sleepSync(delayMs);
+      continue;
+    }
+
+    break;
   }
 
-  let parsed;
-  try {
-    parsed = JSON.parse(result.stdout);
-  } catch (error) {
-    throw new Error(`Failed to parse gh api graphql output: ${error.message}`);
-  }
+  throw new Error(lastErrorMessage);
+}
 
-  if (Array.isArray(parsed.errors) && parsed.errors.length > 0) {
-    const messages = parsed.errors
-      .map((apiError) => apiError.message ?? JSON.stringify(apiError))
-      .join("\n");
-    throw new Error(`GitHub GraphQL returned errors:\n${messages}`);
+function isTransientGhError(result, stderr) {
+  // spawn-level failure (e.g. network reset) or a server-side 5xx / rate-limit /
+  // timeout reported by gh. GraphQL validation errors are status 0 and handled
+  // separately, so they never reach here and are never retried.
+  if (result.error) {
+    return true;
   }
+  return /\bHTTP (?:5\d{2}|408|429)\b/i.test(stderr) || /timeout/i.test(stderr);
+}
 
-  return parsed.data;
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 function resolveProject(org, projectNumber) {
