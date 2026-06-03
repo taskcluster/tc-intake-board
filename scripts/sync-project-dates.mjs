@@ -16,11 +16,26 @@ const PR_LIFECYCLE_OPTIONS = Object.freeze([
 ]);
 const STALE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
 
-// Each item now carries heavy per-item sub-selections (statusCheckRollup,
+// Each item now carries heavy per-item sub-selections (status check contexts,
 // reviewThreads) on top of fieldValues. Keep the page small so a single
 // paginated query stays under GitHub's GraphQL execution timeout (large pages
 // were returning HTTP 502). Pagination still covers the whole board.
-const ITEMS_PAGE_SIZE = 20;
+const ITEMS_PAGE_SIZE = 10;
+
+// CI is judged only on Taskcluster checks. A check counts as Taskcluster if its
+// status-context string, check-run name, or GitHub App slug matches this
+// pattern. Override with TASKCLUSTER_CHECK_PATTERN (a case-insensitive regex)
+// if a deployment uses a different app slug or context name.
+const TASKCLUSTER_CHECK_PATTERN = process.env.TASKCLUSTER_CHECK_PATTERN
+  ? new RegExp(process.env.TASKCLUSTER_CHECK_PATTERN, "i")
+  : /taskcluster|community-tc/i;
+
+const FAILING_CHECK_CONCLUSIONS = new Set([
+  "FAILURE",
+  "TIMED_OUT",
+  "STARTUP_FAILURE",
+  "ACTION_REQUIRED",
+]);
 
 const PROJECT_QUERY = `
 query($org: String!, $projectNumber: Int!) {
@@ -137,7 +152,25 @@ query($org: String!, $projectNumber: Int!, $cursor: String) {
                 nodes {
                   commit {
                     statusCheckRollup {
-                      state
+                      contexts(first: 100) {
+                        nodes {
+                          __typename
+                          ... on CheckRun {
+                            name
+                            status
+                            conclusion
+                            checkSuite {
+                              app {
+                                slug
+                              }
+                            }
+                          }
+                          ... on StatusContext {
+                            context
+                            state
+                          }
+                        }
+                      }
                     }
                   }
                 }
@@ -355,8 +388,8 @@ export function classifyPullRequest(pr, { now = new Date() } = {}) {
   }
 
   const isDraft = pr.isDraft === true || isWipTitle(pr.title);
-  const ciFailing = pr.ciState === "FAILURE" || pr.ciState === "ERROR";
-  const ciPassing = pr.ciState === "SUCCESS" || pr.ciState == null;
+  const ciFailing = pr.ciFailing === true;
+  const ciPassing = !pr.ciFailing && !pr.ciPending;
   const hasUnresolvedThreads = (pr.unresolvedThreadCount ?? 0) > 0;
   const blocked = isBlockedPullRequest(pr);
 
@@ -743,8 +776,10 @@ function normalizePullRequest(content) {
   }
 
   const reviewThreadNodes = content.reviewThreads?.nodes ?? [];
-  const ciState =
-    content.commits?.nodes?.[0]?.commit?.statusCheckRollup?.state ?? null;
+  const checkContexts =
+    content.commits?.nodes?.[0]?.commit?.statusCheckRollup?.contexts?.nodes ??
+    [];
+  const taskclusterContexts = checkContexts.filter(isTaskclusterCheck);
 
   return {
     title: content.title ?? "",
@@ -760,8 +795,44 @@ function normalizePullRequest(content) {
     unresolvedThreadCount: reviewThreadNodes.filter(
       (node) => node?.isResolved === false,
     ).length,
-    ciState,
+    // Only Taskcluster checks are considered. No matching check => neither
+    // failing nor pending (treated as non-blocking, like having no CI).
+    ciFailing: taskclusterContexts.some(isFailingCheck),
+    ciPending: taskclusterContexts.some(isPendingCheck),
   };
+}
+
+export function isTaskclusterCheck(context) {
+  if (!context) {
+    return false;
+  }
+  if (context.__typename === "CheckRun") {
+    return (
+      TASKCLUSTER_CHECK_PATTERN.test(context.name ?? "") ||
+      TASKCLUSTER_CHECK_PATTERN.test(context.checkSuite?.app?.slug ?? "")
+    );
+  }
+  if (context.__typename === "StatusContext") {
+    return TASKCLUSTER_CHECK_PATTERN.test(context.context ?? "");
+  }
+  return false;
+}
+
+export function isFailingCheck(context) {
+  if (context.__typename === "CheckRun") {
+    return (
+      context.status === "COMPLETED" &&
+      FAILING_CHECK_CONCLUSIONS.has(context.conclusion)
+    );
+  }
+  return context.state === "FAILURE" || context.state === "ERROR";
+}
+
+export function isPendingCheck(context) {
+  if (context.__typename === "CheckRun") {
+    return context.status !== "COMPLETED" || context.conclusion == null;
+  }
+  return context.state === "PENDING" || context.state === "EXPECTED";
 }
 
 function normalizeIssueFieldValue(issueFieldValue) {

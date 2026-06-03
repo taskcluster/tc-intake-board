@@ -4,6 +4,9 @@ import { test } from "node:test";
 import {
   buildPlannedUpdates,
   classifyPullRequest,
+  isFailingCheck,
+  isPendingCheck,
+  isTaskclusterCheck,
 } from "../scripts/sync-project-dates.mjs";
 
 const NOW = new Date("2026-06-03T00:00:00Z");
@@ -23,7 +26,8 @@ function pr(overrides = {}) {
     labelNames: [],
     reviewRequestCount: 0,
     unresolvedThreadCount: 0,
-    ciState: null,
+    ciFailing: false,
+    ciPending: false,
     ...overrides,
   };
 }
@@ -49,13 +53,9 @@ test("changes requested needs author action", () => {
   );
 });
 
-test("failing CI needs author action", () => {
+test("failing Taskcluster CI needs author action", () => {
   assert.equal(
-    classifyPullRequest(pr({ ciState: "FAILURE" }), { now: NOW }),
-    "pr-author-action-needed",
-  );
-  assert.equal(
-    classifyPullRequest(pr({ ciState: "ERROR" }), { now: NOW }),
+    classifyPullRequest(pr({ ciFailing: true }), { now: NOW }),
     "pr-author-action-needed",
   );
 });
@@ -69,18 +69,25 @@ test("unresolved threads need author action", () => {
 
 test("approved + green + mergeable is ready to merge", () => {
   assert.equal(
+    classifyPullRequest(pr({ reviewDecision: "APPROVED" }), { now: NOW }),
+    "pr-ready-to-merge",
+  );
+});
+
+test("approved with no Taskcluster checks is still ready to merge", () => {
+  assert.equal(
     classifyPullRequest(
-      pr({ reviewDecision: "APPROVED", ciState: "SUCCESS" }),
+      pr({ reviewDecision: "APPROVED", ciFailing: false, ciPending: false }),
       { now: NOW },
     ),
     "pr-ready-to-merge",
   );
 });
 
-test("approved with no CI configured is still ready to merge", () => {
-  assert.equal(
+test("approved but pending Taskcluster CI is not yet ready to merge", () => {
+  assert.notEqual(
     classifyPullRequest(
-      pr({ reviewDecision: "APPROVED", ciState: null }),
+      pr({ reviewDecision: "APPROVED", ciPending: true }),
       { now: NOW },
     ),
     "pr-ready-to-merge",
@@ -90,7 +97,7 @@ test("approved with no CI configured is still ready to merge", () => {
 test("approved but conflicting is not ready to merge", () => {
   assert.notEqual(
     classifyPullRequest(
-      pr({ reviewDecision: "APPROVED", mergeable: "CONFLICTING", ciState: "SUCCESS" }),
+      pr({ reviewDecision: "APPROVED", mergeable: "CONFLICTING" }),
       { now: NOW },
     ),
     "pr-ready-to-merge",
@@ -278,4 +285,91 @@ test("non-PR items get no lifecycle update", () => {
 test("missing lifecycle field yields no lifecycle update", () => {
   const updates = buildPlannedUpdates(prItem(), new Map());
   assert.equal(updates.length, 0);
+});
+
+// --- Taskcluster check identification ---
+
+test("identifies a Taskcluster status context", () => {
+  assert.equal(
+    isTaskclusterCheck({
+      __typename: "StatusContext",
+      context: "Taskcluster (pull_request)",
+      state: "FAILURE",
+    }),
+    true,
+  );
+});
+
+test("identifies a check run by Taskcluster app slug", () => {
+  assert.equal(
+    isTaskclusterCheck({
+      __typename: "CheckRun",
+      name: "lint",
+      status: "COMPLETED",
+      conclusion: "FAILURE",
+      checkSuite: { app: { slug: "community-tc" } },
+    }),
+    true,
+  );
+  assert.equal(
+    isTaskclusterCheck({
+      __typename: "CheckRun",
+      name: "tests",
+      checkSuite: { app: { slug: "firefoxci-taskcluster" } },
+    }),
+    true,
+  );
+});
+
+test("ignores non-Taskcluster checks", () => {
+  assert.equal(
+    isTaskclusterCheck({
+      __typename: "CheckRun",
+      name: "codecov/project",
+      checkSuite: { app: { slug: "codecov" } },
+    }),
+    false,
+  );
+  assert.equal(
+    isTaskclusterCheck({
+      __typename: "StatusContext",
+      context: "continuous-integration/appveyor",
+      state: "SUCCESS",
+    }),
+    false,
+  );
+});
+
+test("isFailingCheck only counts completed failing conclusions", () => {
+  assert.equal(
+    isFailingCheck({ __typename: "CheckRun", status: "COMPLETED", conclusion: "FAILURE" }),
+    true,
+  );
+  assert.equal(
+    isFailingCheck({ __typename: "CheckRun", status: "COMPLETED", conclusion: "SUCCESS" }),
+    false,
+  );
+  // In-progress is not yet a failure.
+  assert.equal(
+    isFailingCheck({ __typename: "CheckRun", status: "IN_PROGRESS", conclusion: null }),
+    false,
+  );
+  // Cancelled / neutral are not treated as failures.
+  assert.equal(
+    isFailingCheck({ __typename: "CheckRun", status: "COMPLETED", conclusion: "CANCELLED" }),
+    false,
+  );
+  assert.equal(isFailingCheck({ __typename: "StatusContext", state: "ERROR" }), true);
+});
+
+test("isPendingCheck counts not-yet-completed runs", () => {
+  assert.equal(
+    isPendingCheck({ __typename: "CheckRun", status: "IN_PROGRESS", conclusion: null }),
+    true,
+  );
+  assert.equal(
+    isPendingCheck({ __typename: "CheckRun", status: "COMPLETED", conclusion: "SUCCESS" }),
+    false,
+  );
+  assert.equal(isPendingCheck({ __typename: "StatusContext", state: "PENDING" }), true);
 });

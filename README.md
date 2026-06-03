@@ -67,7 +67,7 @@ Exactly one label is assigned, chosen by the first matching rule in this priorit
 
 | Label | When |
 |---|---|
-| `pr-author-action-needed` | Changes requested, failing CI (`FAILURE`/`ERROR`), or unresolved review threads. |
+| `pr-author-action-needed` | Changes requested, a failing **Taskcluster** check, or unresolved review threads. |
 | `pr-blocked` | Has a `blocked` label, or the body says `depends on #N` / `blocked by #N` / `blocked by:`. |
 | `pr-ready-to-merge` | Not draft, approved, mergeable, CI passing (or none configured), no unresolved threads. |
 | `pr-review-pending` | Not draft, with reviewers requested or review explicitly required. Also the default for an open non-draft PR with nothing else pending. |
@@ -77,13 +77,34 @@ Exactly one label is assigned, chosen by the first matching rule in this priorit
 Unlike the week fields, the lifecycle label is **recomputed and overwritten every run** because it is
 dynamic. Issues and closed/merged PRs are left untouched.
 
+### CI signal (Taskcluster only)
+
+Only **Taskcluster** checks count toward the CI part of the rules — other checks (GitHub Actions,
+Codecov, etc.) are ignored. A check is treated as Taskcluster when its status-context string,
+check-run name, or GitHub App slug matches a pattern (default `taskcluster|community-tc`,
+case-insensitive). If a repo has no Taskcluster checks, CI is treated as non-blocking (it neither
+blocks merge nor triggers author-action).
+
+Override the matcher with `TASKCLUSTER_CHECK_PATTERN` (a case-insensitive regex) if a deployment
+uses a different app slug or context name. To see what your PRs actually report, inspect a PR's
+checks:
+
+```sh
+gh api graphql -f query='
+query { repository(owner:"taskcluster", name:"taskcluster") { pullRequest(number: 8514) {
+  commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{
+    __typename ... on CheckRun{name checkSuite{app{slug}} conclusion}
+    ... on StatusContext{context state}}}}}}} } } }'
+```
+
 ### Lifecycle limitations
 
 - `pr-blocked` is best-effort: only an explicit `blocked` label or `depends on`/`blocked by` markers
   in the body are detected. External-team, infra-outage, or decision blockers are not observable and
   will not be caught.
 - Only the first 50 review threads per PR are inspected for unresolved state.
-- CI is read from the rollup of the latest commit; no checks configured is treated as non-blocking.
+- Only the first 100 status checks on the latest commit are inspected; a Taskcluster failure beyond
+  the first 100 contexts could be missed on very large PRs.
 
 ## Configuration
 
@@ -95,6 +116,7 @@ PROJECT_NUMBER=23
 GH_TOKEN=...
 DRY_RUN=false
 VERBOSE=false
+TASKCLUSTER_CHECK_PATTERN=taskcluster|community-tc
 ```
 
 ## Limitations
