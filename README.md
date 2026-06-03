@@ -43,6 +43,48 @@ GitHub's documentation recommends a GitHub App for organization project automati
 - Uses UTC dates.
 - Derives ISO week values as `YYYY-Www`.
 
+## PR lifecycle labeling
+
+For **open pull requests**, the sync also computes a single PR-lifecycle label from observable
+GitHub state and writes it to an optional single-select project field.
+
+Create this field on the board to enable it (the script validates but does not create fields):
+
+- `PR lifecycle`: Single select, with these options (names must match exactly):
+  - `pr-author-action-needed`
+  - `pr-blocked`
+  - `pr-ready-to-merge`
+  - `pr-review-pending`
+  - `pr-stale`
+  - `pr-draft-or-not-ready`
+
+If the field is absent or not single-select, lifecycle labeling is skipped with a warning and the
+date sync continues unaffected.
+
+Exactly one label is assigned, chosen by the first matching rule in this priority order:
+
+`pr-author-action-needed` > `pr-blocked` > `pr-ready-to-merge` > `pr-review-pending` > `pr-stale` > `pr-draft-or-not-ready`
+
+| Label | When |
+|---|---|
+| `pr-author-action-needed` | Changes requested, failing CI (`FAILURE`/`ERROR`), or unresolved review threads. |
+| `pr-blocked` | Has a `blocked` label, or the body says `depends on #N` / `blocked by #N` / `blocked by:`. |
+| `pr-ready-to-merge` | Not draft, approved, mergeable, CI passing (or none configured), no unresolved threads. |
+| `pr-review-pending` | Not draft, with reviewers requested or review explicitly required. Also the default for an open non-draft PR with nothing else pending. |
+| `pr-stale` | No activity for 7+ days and not blocked (reachable only when no reviewers are assigned, since review-pending outranks stale). |
+| `pr-draft-or-not-ready` | Draft, or `WIP`/`draft:` in the title. |
+
+Unlike the week fields, the lifecycle label is **recomputed and overwritten every run** because it is
+dynamic. Issues and closed/merged PRs are left untouched.
+
+### Lifecycle limitations
+
+- `pr-blocked` is best-effort: only an explicit `blocked` label or `depends on`/`blocked by` markers
+  in the body are detected. External-team, infra-outage, or decision blockers are not observable and
+  will not be caught.
+- Only the first 50 review threads per PR are inspected for unresolved state.
+- CI is read from the rollup of the latest commit; no checks configured is treated as non-blocking.
+
 ## Configuration
 
 Environment variables:

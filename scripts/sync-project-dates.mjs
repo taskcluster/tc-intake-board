@@ -5,6 +5,17 @@ import { fileURLToPath } from "node:url";
 const OPENED_WEEK_FIELD_NAMES = ["Opened week", "Intake week"];
 const COMPLETED_WEEK_FIELD_NAME = "Completed week";
 
+const PR_LIFECYCLE_FIELD_NAME = "PR lifecycle";
+const PR_LIFECYCLE_OPTIONS = Object.freeze([
+  "pr-author-action-needed",
+  "pr-blocked",
+  "pr-ready-to-merge",
+  "pr-review-pending",
+  "pr-stale",
+  "pr-draft-or-not-ready",
+]);
+const STALE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
+
 const PROJECT_QUERY = `
 query($org: String!, $projectNumber: Int!) {
   organization(login: $org) {
@@ -97,6 +108,34 @@ query($org: String!, $projectNumber: Int!, $cursor: String) {
               closedAt
               merged
               mergedAt
+              isDraft
+              updatedAt
+              mergeable
+              reviewDecision
+              bodyText
+              labels(first: 20) {
+                nodes {
+                  name
+                }
+              }
+              reviewRequests(first: 1) {
+                totalCount
+              }
+              reviewThreads(first: 50) {
+                totalCount
+                nodes {
+                  isResolved
+                }
+              }
+              commits(last: 1) {
+                nodes {
+                  commit {
+                    statusCheckRollup {
+                      state
+                    }
+                  }
+                }
+              }
             }
           }
           fieldValues(first: 100) {
@@ -223,6 +262,21 @@ mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $text: String!) {
 }
 `;
 
+const UPDATE_SINGLE_SELECT_MUTATION = `
+mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+  updateProjectV2ItemFieldValue(input: {
+    projectId: $projectId
+    itemId: $itemId
+    fieldId: $fieldId
+    value: { singleSelectOptionId: $optionId }
+  }) {
+    projectV2Item {
+      id
+    }
+  }
+}
+`;
+
 export function toDateOnly(isoDateTime) {
   if (typeof isoDateTime !== "string" || isoDateTime.trim() === "") {
     return "";
@@ -289,6 +343,88 @@ export function validateGithubToken(token) {
   }
 }
 
+export function classifyPullRequest(pr, { now = new Date() } = {}) {
+  if (!pr || pr.closed || pr.merged) {
+    return null;
+  }
+
+  const isDraft = pr.isDraft === true || isWipTitle(pr.title);
+  const ciFailing = pr.ciState === "FAILURE" || pr.ciState === "ERROR";
+  const ciPassing = pr.ciState === "SUCCESS" || pr.ciState == null;
+  const hasUnresolvedThreads = (pr.unresolvedThreadCount ?? 0) > 0;
+  const blocked = isBlockedPullRequest(pr);
+
+  // Priority order:
+  // author-action-needed > blocked > ready-to-merge > review-pending > stale > draft.
+  if (
+    pr.reviewDecision === "CHANGES_REQUESTED" ||
+    ciFailing ||
+    hasUnresolvedThreads
+  ) {
+    return "pr-author-action-needed";
+  }
+
+  if (blocked) {
+    return "pr-blocked";
+  }
+
+  if (
+    !isDraft &&
+    pr.reviewDecision === "APPROVED" &&
+    pr.mergeable === "MERGEABLE" &&
+    ciPassing &&
+    !hasUnresolvedThreads
+  ) {
+    return "pr-ready-to-merge";
+  }
+
+  if (
+    !isDraft &&
+    (pr.reviewDecision === "REVIEW_REQUIRED" ||
+      (pr.reviewRequestCount ?? 0) > 0)
+  ) {
+    return "pr-review-pending";
+  }
+
+  if (isStale(pr.updatedAt, now)) {
+    return "pr-stale";
+  }
+
+  if (isDraft) {
+    return "pr-draft-or-not-ready";
+  }
+
+  // Open, non-draft, recent, no explicit reviewers, not approved: gentlest bucket.
+  return "pr-review-pending";
+}
+
+function isWipTitle(title) {
+  return typeof title === "string" && /\bwip\b|^\s*draft:/i.test(title);
+}
+
+function isBlockedPullRequest(pr) {
+  const labelNames = pr.labelNames ?? [];
+  if (labelNames.some((name) => String(name).toLowerCase() === "blocked")) {
+    return true;
+  }
+
+  const body = pr.bodyText ?? "";
+  return /\b(?:depends on|blocked by)\b\s*(?::|#\d+)/i.test(body);
+}
+
+function isStale(updatedAt, now) {
+  if (isEmptyValue(updatedAt)) {
+    return false;
+  }
+
+  const updated = new Date(updatedAt);
+  if (Number.isNaN(updated.getTime())) {
+    return false;
+  }
+
+  return now.getTime() - updated.getTime() >= STALE_AFTER_MS;
+}
+
 export function buildPlannedUpdates(item, fields) {
   const itemFields = item.fields ?? {};
   const updates = [];
@@ -329,7 +465,43 @@ export function buildPlannedUpdates(item, fields) {
     );
   }
 
+  const lifecycleUpdate = buildLifecycleUpdate(item, fields);
+  if (lifecycleUpdate) {
+    updates.push(lifecycleUpdate);
+  }
+
   return updates;
+}
+
+function buildLifecycleUpdate(item, fields, { now } = {}) {
+  if (!item.pullRequest) {
+    return null;
+  }
+
+  const field = getField(fields, PR_LIFECYCLE_FIELD_NAME);
+  if (!field || field.dataType !== "SINGLE_SELECT") {
+    return null;
+  }
+
+  const label = classifyPullRequest(item.pullRequest, { now });
+  if (!label) {
+    return null;
+  }
+
+  const option = (field.options ?? []).find((opt) => opt.name === label);
+  if (!option) {
+    return null;
+  }
+
+  // Lifecycle is dynamic: recompute every run and overwrite when it changes,
+  // unlike the never-overwrite week fields.
+  if (item.fields?.[PR_LIFECYCLE_FIELD_NAME] === label) {
+    return null;
+  }
+
+  return makeUpdate(item, field, "singleSelect", label, {
+    optionId: option.id,
+  });
 }
 
 function makeUpdate(item, field, type, value, extra = {}) {
@@ -523,7 +695,35 @@ function normalizeItem(item) {
     contentType: item.content?.__typename ?? item.type ?? "",
     contentUrl: item.content?.url ?? "",
     closedAt: fieldValues.Closed ?? item.content?.closedAt ?? "",
+    pullRequest: normalizePullRequest(item.content),
     fields: fieldValues,
+  };
+}
+
+function normalizePullRequest(content) {
+  if (content?.__typename !== "PullRequest") {
+    return null;
+  }
+
+  const reviewThreadNodes = content.reviewThreads?.nodes ?? [];
+  const ciState =
+    content.commits?.nodes?.[0]?.commit?.statusCheckRollup?.state ?? null;
+
+  return {
+    title: content.title ?? "",
+    isDraft: content.isDraft === true,
+    closed: content.closed === true,
+    merged: content.merged === true,
+    updatedAt: content.updatedAt ?? "",
+    mergeable: content.mergeable ?? null,
+    reviewDecision: content.reviewDecision ?? null,
+    bodyText: content.bodyText ?? "",
+    labelNames: (content.labels?.nodes ?? []).map((node) => node?.name ?? ""),
+    reviewRequestCount: content.reviewRequests?.totalCount ?? 0,
+    unresolvedThreadCount: reviewThreadNodes.filter(
+      (node) => node?.isResolved === false,
+    ).length,
+    ciState,
   };
 }
 
@@ -566,6 +766,29 @@ function validateFields(fieldsByName, warn) {
     warn(`Using legacy field "Intake week" for opened-week updates.`);
   }
 
+  const lifecycleField = fieldsByName.get(PR_LIFECYCLE_FIELD_NAME);
+  if (!lifecycleField) {
+    warn(
+      `Optional field "${PR_LIFECYCLE_FIELD_NAME}" is missing; skipping PR lifecycle labeling.`,
+    );
+  } else if (lifecycleField.dataType !== "SINGLE_SELECT") {
+    warn(
+      `Field "${PR_LIFECYCLE_FIELD_NAME}" must be SINGLE_SELECT to enable lifecycle labeling, found ${lifecycleField.dataType}; skipping.`,
+    );
+  } else {
+    const optionNames = new Set(
+      (lifecycleField.options ?? []).map((option) => option.name),
+    );
+    const missingOptions = PR_LIFECYCLE_OPTIONS.filter(
+      (name) => !optionNames.has(name),
+    );
+    if (missingOptions.length > 0) {
+      warn(
+        `Field "${PR_LIFECYCLE_FIELD_NAME}" is missing options: ${missingOptions.join(", ")}. Those labels cannot be applied until the options exist.`,
+      );
+    }
+  }
+
   if (errors.length > 0) {
     throw new Error(`Project field validation failed:\n- ${errors.join("\n- ")}`);
   }
@@ -578,6 +801,16 @@ function executeUpdate(projectId, update) {
       itemId: update.itemId,
       fieldId: update.fieldId,
       text: update.value,
+    });
+    return;
+  }
+
+  if (update.type === "singleSelect") {
+    graphql(UPDATE_SINGLE_SELECT_MUTATION, {
+      projectId,
+      itemId: update.itemId,
+      fieldId: update.fieldId,
+      optionId: update.optionId,
     });
     return;
   }
